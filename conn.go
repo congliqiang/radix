@@ -42,35 +42,18 @@ type connMarshalerUnmarshaler struct {
 type conn struct {
 	proc *proc.Proc
 
-	conn     net.Conn
-	br       *bufio.Reader
-	w        *bufio.Writer
-	rCh, wCh chan connMarshalerUnmarshaler
+	conn         net.Conn
+	rOpts, wOpts *resp.Opts
+	br           *bufio.Reader
+	w            *bufio.Writer
+	rCh, wCh     chan connMarshalerUnmarshaler
 
-	// errChPool is a buffered channel used as a makeshift pool of chan errors,s
-	// owe don't have to make a new one on every EncodeDecode call.
+	// errChPool is a buffered channel used as a makeshift pool of chan errors,
+	// so we don't have to make a new one on every EncodeDecode call.
 	errChPool chan chan error
 }
 
 var _ Conn = new(conn)
-
-// NewConn takes an existing net.Conn and wraps it to support the Conn interface
-// of this package. The Read and Write methods on the original net.Conn should
-// not be used after calling this method.
-func NewConn(netConn net.Conn) Conn {
-	c := &conn{
-		proc:      proc.New(),
-		conn:      netConn,
-		br:        bufio.NewReader(netConn),
-		w:         bufio.NewWriter(netConn),
-		rCh:       make(chan connMarshalerUnmarshaler, 128),
-		wCh:       make(chan connMarshalerUnmarshaler, 128),
-		errChPool: make(chan chan error, 16),
-	}
-	c.proc.Run(c.reader)
-	c.proc.Run(c.writer)
-	return c
-}
 
 func (c *conn) Close() error {
 	return c.proc.PrefixedClose(c.conn.Close, nil)
@@ -78,52 +61,6 @@ func (c *conn) Close() error {
 
 func (c *conn) newRESPOpts() *resp.Opts {
 	return resp.NewOpts()
-}
-
-func (c *conn) writer(ctx context.Context) {
-	doneCh := ctx.Done()
-	opts := c.newRESPOpts()
-	for {
-		select {
-		case <-doneCh:
-			return
-		case mu := <-c.wCh:
-			if mu.marshal != nil {
-				if err := mu.ctx.Err(); err != nil {
-					mu.errCh <- err
-					continue
-				} else if deadline, ok := mu.ctx.Deadline(); ok {
-					if err := c.conn.SetWriteDeadline(deadline); err != nil {
-						mu.errCh <- fmt.Errorf("setting write deadline to %v: %w", deadline, err)
-						continue
-					}
-				} else if err := c.conn.SetWriteDeadline(time.Time{}); err != nil {
-					mu.errCh <- fmt.Errorf("unsetting write deadline: %w", err)
-					continue
-				}
-
-				if err := resp3.Marshal(c.w, mu.marshal, opts); err != nil {
-					mu.errCh <- err
-					continue
-				} else if err := c.w.Flush(); err != nil {
-					mu.errCh <- err
-					continue
-				}
-			}
-
-			// if there's no unmarshaler then don't forward to the reader
-			if mu.unmarshalInto == nil {
-				mu.errCh <- nil
-				continue
-			}
-
-			select {
-			case <-doneCh:
-				return
-			case c.rCh <- mu:
-			}
-		}
-	}
 }
 
 func (c *conn) reader(ctx context.Context) {
@@ -261,6 +198,24 @@ type Dialer struct {
 	NetDialer interface {
 		DialContext(context.Context, string, string) (net.Conn, error)
 	}
+
+	// WriteFlushInterval indicates how often the Conn should flush writes
+	// to the underlying net.Conn.
+	//
+	// Conn uses a bufio.Writer to write data to the underlying net.Conn, and so
+	// requires Flush to be called on that bufio.Writer in order for the data to
+	// be fully written. By delaying Flush calls until multiple concurrent
+	// EncodeDecode calls have been made Conn can reduce system calls and
+	// significantly improve performance in that case.
+	//
+	// All EncodeDecode calls will be delayed up to WriteFlushInterval, with one
+	// exception: if more than WriteFlushInterval has elapsed since the last
+	// EncodeDecode call then the next EncodeDecode will Flush immediately. This
+	// allows Conns to behave well during both low and high activity periods.
+	//
+	// Defaults to 0, indicating Flush will be called upon each EncodeDecode
+	// call without delay.
+	WriteFlushInterval time.Duration
 }
 
 func (d Dialer) withDefaults() Dialer {
@@ -355,7 +310,19 @@ func (d Dialer) Dial(ctx context.Context, network, addr string) (Conn, error) {
 		}
 	}
 
-	conn := NewConn(netConn)
+	conn := &conn{
+		proc:      proc.New(),
+		conn:      netConn,
+		rOpts:     resp.NewOpts(),
+		wOpts:     resp.NewOpts(),
+		br:        bufio.NewReader(netConn),
+		w:         bufio.NewWriter(netConn),
+		rCh:       make(chan connMarshalerUnmarshaler, 128),
+		wCh:       make(chan connMarshalerUnmarshaler, 128),
+		errChPool: make(chan chan error, 16),
+	}
+	conn.proc.Run(conn.reader)
+	conn.proc.Run(func(ctx context.Context) { conn.writer(ctx, d.WriteFlushInterval) })
 
 	if d.AuthUser != "" {
 		if err := conn.Do(ctx, Cmd(nil, "AUTH", d.AuthUser, d.AuthPass)); err != nil {
